@@ -1,0 +1,9 @@
+{
+  "name": "omp-thermal-gate",
+  "version": "0.1.0",
+  "description": "omp extension: hold requests to a hot DGX Spark cluster until sparkDash reports it has cooled",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT",
+  "scripts": { "test": "bun test" }
+}
