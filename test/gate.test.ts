@@ -75,7 +75,7 @@ function load(env: Record<string, string>) {
   const status: Array<string | undefined> = [];
   const notes: string[] = [];
   let aborted = false;
-  ext({ setLabel() {}, on: (ev: string, h: any) => ev === "before_provider_request" && handlers.push(h) } as any);
+  ext({ setLabel() {}, on: (ev: string, h: any) => { if (ev === "before_provider_request") handlers.push(h); } } as any);
   const ctx = {
     model: { provider: "sparks" },
     ui: { setStatus: (_k: string, t?: string) => status.push(t), notify: (m: string) => notes.push(m) },

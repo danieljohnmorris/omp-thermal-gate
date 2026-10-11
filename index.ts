@@ -1,7 +1,9 @@
 /**
  * omp-thermal-gate
  *
- * Holds omp's requests to a hot GPU cluster until it cools down.
+ * Two gates for omp on a shared DGX Spark cluster:
+ *  - thermal gate: holds omp's requests to a hot GPU cluster until it cools down;
+ *  - busy gate: refuses new Sparks-model subagents while Machinist is busy (see below).
  *
  * Before every provider request to a gated provider (default: `sparks`), the
  * extension asks sparkDash for each unit's GPU temperature
@@ -173,6 +175,95 @@ export function shouldGate(provider: string | undefined, cfg: GateConfig): boole
   return !cfg.disabled && !!provider && cfg.providers.includes(provider);
 }
 
+// ---------------------------------------------------------------------------
+// Busy gate: no new Sparks subagents while Machinist is busy.
+//
+// Machinist (OhMyMachinist) runs its own coding jobs on the same Sparks. When
+// it has OMP_BUSY_GATE_MAX_RUNNING or more jobs in state "running", this gate
+// refuses to spawn new subagents whose model resolves to a gated provider
+// (default `sparks`). Subagents on cloud models still spawn. Requests from the
+// main session and from subagents that are already running are not touched.
+//
+// It hooks omp's `before_subagent_spawn` event (task tool and eval `agent()`),
+// which fires in the parent session before the child is created and can
+// return { block, reason }. The reason reaches the model as the task tool's
+// error, so the agent can do the work itself, pick a cloud model, or retry.
+//
+//   MACHINIST_URL                 Machinist base URL (default http://100.70.205.115:7331)
+//   OMP_BUSY_GATE_MAX_RUNNING     refuse Sparks spawns at or above this many running jobs (default 3)
+//   OMP_BUSY_GATE_PROVIDERS       providers whose subagents are gated (default: OMP_THERMAL_GATE_PROVIDERS, else "sparks")
+//   OMP_BUSY_GATE_FALLBACK_MODEL  optional model pattern to reroute a refused spawn to (e.g. a cloud model) instead of refusing
+//   OMP_BUSY_GATE_CACHE_MS        reuse a Machinist reading this long (default 3000)
+//   OMP_BUSY_GATE_DISABLED        truthy => busy gate does nothing
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_MACHINIST_URL = "http://100.70.205.115:7331";
+
+export interface BusyConfig {
+  url: string;
+  maxRunning: number;
+  providers: string[];
+  fallbackModel: string;
+  cacheMs: number;
+  disabled: boolean;
+}
+
+export function readBusyConfig(env: Record<string, string | undefined> = process.env): BusyConfig {
+  return {
+    url: ((env.MACHINIST_URL ?? "").trim() || DEFAULT_MACHINIST_URL).replace(/\/+$/, ""),
+    maxRunning: Math.max(1, Math.floor(num(env.OMP_BUSY_GATE_MAX_RUNNING, 3))),
+    providers: list(env.OMP_BUSY_GATE_PROVIDERS, list(env.OMP_THERMAL_GATE_PROVIDERS, ["sparks"])),
+    fallbackModel: (env.OMP_BUSY_GATE_FALLBACK_MODEL ?? "").trim(),
+    cacheMs: num(env.OMP_BUSY_GATE_CACHE_MS, 3000),
+    disabled: truthy(env.OMP_BUSY_GATE_DISABLED),
+  };
+}
+
+export interface BusyReading {
+  running?: number;
+  error?: string;
+}
+
+/** Count Machinist jobs in state "running" from a /api/v1/status body. */
+export function countRunning(body: any): number | undefined {
+  const jobs = body?.jobs;
+  if (!Array.isArray(jobs)) return undefined;
+  return jobs.filter((j: any) => j?.state === "running").length;
+}
+
+/** Read-only: GET /api/v1/status. Never sends credentials; ignores csrf_token. */
+export async function readMachinist(cfg: BusyConfig, fetchImpl: FetchLike = fetch as any): Promise<BusyReading> {
+  try {
+    const res = await fetchImpl(`${cfg.url}/api/v1/status`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (!res.ok) return { error: `Machinist HTTP ${res.status}` };
+    const running = countRunning(await res.json());
+    return running === undefined ? { error: "Machinist status has no jobs list" } : { running };
+  } catch (err) {
+    return { error: `Machinist unreachable (${err instanceof Error ? err.message : String(err)})` };
+  }
+}
+
+/** Provider of a model pattern such as "sparks/GLM-5.3-Flash-EXL3-bg:auto". */
+export function providerOf(pattern: string | undefined): string | undefined {
+  const p = (pattern ?? "").trim();
+  const slash = p.indexOf("/");
+  return slash > 0 ? p.slice(0, slash) : undefined;
+}
+
+/**
+ * Whether a spawn would land on a gated provider. omp tries `patterns` in
+ * order, so the first one decides. With no patterns the child inherits the
+ * parent session's model.
+ */
+export function spawnTargetsGated(patterns: string[] | undefined, parentProvider: string | undefined, cfg: Pick<BusyConfig, "providers">): boolean {
+  const first = patterns?.find(p => p.trim() !== "");
+  const provider = first !== undefined ? providerOf(first) : parentProvider;
+  return !!provider && cfg.providers.includes(provider);
+}
+
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 interface Gate {
@@ -256,6 +347,52 @@ export default function (pi: ExtensionAPI) {
     }
     return undefined;
   };
+
+  // ---- busy gate: refuse new Sparks subagents while Machinist is busy ----
+  let busyCache: { at: number; reading: BusyReading } | undefined;
+  let busyLastError: string | undefined;
+  const BUSY_STATUS_KEY = "busy-gate";
+
+  pi.on("before_subagent_spawn", async (event: any, ctx: any) => {
+    const cfg = readBusyConfig();
+    if (cfg.disabled) return undefined;
+    if (!spawnTargetsGated(event?.patterns, ctx?.model?.provider, cfg)) return undefined;
+
+    let reading = busyCache && Date.now() - busyCache.at < cfg.cacheMs ? busyCache.reading : undefined;
+    if (!reading) {
+      reading = await readMachinist(cfg);
+      busyCache = { at: Date.now(), reading };
+    }
+    if (reading.error) {
+      // Fail open: Machinist down must never stop omp from spawning.
+      if (reading.error !== busyLastError) {
+        busyLastError = reading.error;
+        ctx.ui?.notify?.(`Busy gate: ${reading.error}; not gating subagents`, "warning");
+      }
+      ctx.ui?.setStatus?.(BUSY_STATUS_KEY, undefined);
+      return undefined;
+    }
+    busyLastError = undefined;
+    const running = reading.running ?? 0;
+    if (running < cfg.maxRunning) {
+      ctx.ui?.setStatus?.(BUSY_STATUS_KEY, undefined);
+      return undefined;
+    }
+
+    const why = `Machinist has ${running} jobs running (limit ${cfg.maxRunning})`;
+    ctx.ui?.setStatus?.(BUSY_STATUS_KEY, `⚙ ${why}: no new Sparks subagents`);
+    if (cfg.fallbackModel) {
+      ctx.ui?.notify?.(`Busy gate: ${why}; ${event?.agent ?? "subagent"} → ${cfg.fallbackModel}`, "info");
+      return { model: cfg.fallbackModel, note: `busy gate: ${why}` };
+    }
+    ctx.ui?.notify?.(`Busy gate: ${why}; refused Sparks subagent ${event?.agent ?? ""}`.trim(), "warning");
+    return {
+      block: true,
+      reason:
+        `Busy gate: ${why}, so new subagents on Sparks models are paused. ` +
+        `Do this work in the current session, spawn it on a cloud model instead, or try again later.`,
+    };
+  });
 
   // The chain is sized at load time from MAX_WAIT_MS (+1 slice for the timeout decision).
   const chain = Math.min(MAX_CHAIN, Math.ceil(readConfig().maxWaitMs / SLICE_MS) + 1);
